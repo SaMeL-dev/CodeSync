@@ -1,5 +1,6 @@
 // server.c
 // CodeSync Server
+// 컴파일: gcc server.c -o server -lws2_32
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,29 +16,29 @@
 
 #define BUF_SIZE 4096
 #define MAX_CLNT 256
-#define MAX_MSG_LEN 10240 // 코드 커밋을 처리하기 위한 버퍼 크기 설정
+#define MAX_MSG_LEN 10240
 
-// 클라이언트 정보를 저장하기 위한 구조체
+// 클라이언트 정보 구조체
 typedef struct {
     SOCKET sock;
     char id[30];
 } ClientInfo;
 
-// 함수 선언부
-unsigned WINAPI HandleClient(void* arg);                    // 클라이언트 개별 처리
-void ErrorHandling(char* msg);                              // 오류 처리 함수
-int AuthenticateUser(char* id, char* pw);                   // 사용자 인증
-void CreateProject(char* projectName, SOCKET sock);         // 프로젝트 생성
-void ProcessCommit(char* data, SOCKET sock, char* userID);  // 커밋 처리
-void SendHistory(char* projectName, SOCKET sock);           // 히스토리 전송
-void SendList(char* projectName, SOCKET sock);              // 목록 전송
-void SearchCommits(char* projectName, char* keyword, SOCKET sock);                      // 커밋 검색
-void RevokeCommitByID(char* projectName, char* commitID, char* userID, SOCKET sock);    // 커밋 무효화
-void BroadcastUpdate(char* projectName, SOCKET from_sock);                              // 다른 클라이언트에게 갱신 통지
+// 함수 프로토타입 선언
+unsigned WINAPI HandleClient(void* arg);
+void ErrorHandling(char* msg);
+int AuthenticateUser(char* id, char* pw);
+void CreateProject(char* projectName, SOCKET sock);
+void ProcessCommit(char* data, SOCKET sock, char* userID);
+void SendHistory(char* projectName, SOCKET sock);
+void RevokeCommit(char* data, SOCKET sock);
+void SendCommitCode(char* data, SOCKET sock);
+void BroadcastUpdate(char* projectName, SOCKET from_sock);
 
-int clntCnt = 0;                     // 현재 접속 중인 클라이언트 수
-ClientInfo clntSocks[MAX_CLNT];      // 클라이언트 목록
-HANDLE hMutex;                       // 동기화를 위한 뮤텍스
+// 전역 변수
+int clntCnt = 0;
+ClientInfo clntSocks[MAX_CLNT];
+HANDLE hMutex;
 
 int main(int argc, char* argv[]) {
     WSADATA wsaData;
@@ -67,44 +68,42 @@ int main(int argc, char* argv[]) {
     if (listen(hServSock, 5) == SOCKET_ERROR)
         ErrorHandling("listen() 함수 오류");
 
-    // users.txt 파일이 존재하지 않으면 생성
+    // users.txt 파일 생성 (없을 경우)
     FILE* fp = fopen("users.txt", "a");
     if (fp == NULL) {
         ErrorHandling("users.txt 파일 열기 오류");
     }
-    // else {
-    //     // 예시로 기본 사용자 계정 추가
-    //     fputs("samel123 1234\n", fp);
-    //     fputs("guest 1234\n", fp);
-    //     fclose(fp);
-    // }
-    printf("CodeSync 서버 구동 중...\n");
+    // 기본 사용자 추가 (최초 실행 시)
+    if (ftell(fp) == 0) {
+        fputs("samel123 1234\n", fp);
+        fputs("guest 1234\n", fp);
+    }
+    fclose(fp);
+    printf("CodeSync 서버 시작...\n");
 
-    // 클라이언트 연결 대기 루프
     while (1) {
         clntAdrSz = sizeof(clntAdr);
         hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &clntAdrSz);
         if (hClntSock == INVALID_SOCKET) {
-            ErrorHandling("accept() error");
+            ErrorHandling("accept() 오류");
             continue;
         }
 
         char id[30], pw[30], buffer[BUF_SIZE];
         int strLen;
 
-        // 클라이언트 로그인 처리
+        // 로그인 처리
         strLen = recv(hClntSock, buffer, BUF_SIZE - 1, 0);
         buffer[strLen] = 0;
-        
+
         char* token = strtok(buffer, "\n");
         if (token) strncpy(id, token, sizeof(id) - 1);
         token = strtok(NULL, "\n");
         if (token) strncpy(pw, token, sizeof(pw) - 1);
-        
+
         if (AuthenticateUser(id, pw)) {
             send(hClntSock, "LOGIN_SUCCESS##END##\n", 21, 0);
-            
-            // 동기화 후 클라이언트 목록에 추가
+
             WaitForSingleObject(hMutex, INFINITE);
             clntSocks[clntCnt].sock = hClntSock;
             strcpy(clntSocks[clntCnt].id, id);
@@ -112,7 +111,7 @@ int main(int argc, char* argv[]) {
             ReleaseMutex(hMutex);
 
             hThread = (HANDLE)_beginthreadex(NULL, 0, HandleClient, (void*)&hClntSock, 0, NULL);
-            printf("클라이언트 접속 IP: %s, ID: %s\n", inet_ntoa(clntAdr.sin_addr), id);
+            printf("클라이언트 접속: %s (ID: %s)\n", inet_ntoa(clntAdr.sin_addr), id);
         } else {
             send(hClntSock, "LOGIN_FAIL##END##\n", 18, 0);
             closesocket(hClntSock);
@@ -128,8 +127,7 @@ unsigned WINAPI HandleClient(void* arg) {
     int strLen = 0;
     char msg[MAX_MSG_LEN];
     char* userID = NULL;
-    
-    // 이 소켓에 해당하는 사용자 ID 찾기
+
     WaitForSingleObject(hMutex, INFINITE);
     for (int i = 0; i < clntCnt; i++) {
         if (clntSocks[i].sock == hClntSock) {
@@ -140,58 +138,51 @@ unsigned WINAPI HandleClient(void* arg) {
     ReleaseMutex(hMutex);
 
     if (userID == NULL) {
-        printf("오류: 소켓에 해당하는 사용자 ID를 찾을 수 없음\n");
         closesocket(hClntSock);
         return 1;
     }
 
-
-    // 명령어 수신 및 처리 루프
-    while ((strLen = recv(hClntSock, msg, MAX_MSG_LEN, 0)) != 0 && strLen != -1) {
-        if(strstr(msg, "##END##") == NULL) continue; // 메시지가 끝까지 오지 않을 시
-        
+    while ((strLen = recv(hClntSock, msg, MAX_MSG_LEN -1, 0)) > 0) {
         msg[strLen] = 0;
-        
-        char* token_end = strstr(msg, "##END##");
-        if(token_end) *token_end = '\0';
-        
-        printf("명령 수신 [%s]: %s\n", userID, msg);
+        char* p_msg = msg;
+        while( (p_msg = strstr(p_msg, "##END##")) != NULL ){
+             *p_msg = '\0'; // Temporarily terminate the string
+             char* command_start = msg;
 
-        char* command = strtok(msg, "\n");
-        if (!command) continue;
+             printf("명령 수신 [%s]: %.30s...\n", userID, command_start);
 
-        if (strcmp(command, "create_project") == 0) {
-            char* projectName = strtok(NULL, "\n");
-            CreateProject(projectName, hClntSock);
-        } else if (strcmp(command, "commit") == 0) {
-            ProcessCommit(command + strlen(command) + 1, hClntSock, userID);
-        } else if (strcmp(command, "history") == 0) {
-            char* projectName = strtok(NULL, "\n");
-            SendHistory(projectName, hClntSock);
-        } else if (strcmp(command, "list") == 0) {
-            char* projectName = strtok(NULL, "\n");
-            SendList(projectName, hClntSock);
-        } else if (strcmp(command, "search") == 0) {
-            char* projectName = strtok(NULL, "\n");
-            char* keyword = strtok(NULL, "\n");
-            SearchCommits(projectName, keyword, hClntSock);
-        } else if (strcmp(command, "revoke") == 0) {
-            char* projectName = strtok(NULL, "\n");
-            char* commitID = strtok(NULL, "\n");
-            RevokeCommitByID(projectName, commitID, userID, hClntSock);
-        } else {
-            send(hClntSock, "INVALID_COMMAND##END##\n", 23, 0);
+             char* command = strtok(command_start, "\n");
+             if (!command) continue;
+
+             char* data = command + strlen(command) + 1;
+
+             if (strcmp(command, "create_project") == 0) {
+                 CreateProject(data, hClntSock);
+             } else if (strcmp(command, "commit") == 0) {
+                 ProcessCommit(data, hClntSock, userID);
+             } else if (strcmp(command, "history") == 0) {
+                 SendHistory(data, hClntSock);
+             } else if (strcmp(command, "revoke") == 0) {
+                 RevokeCommit(data, hClntSock);
+             } else if (strcmp(command, "view") == 0) {
+                 SendCommitCode(data, hClntSock);
+             } else {
+                 send(hClntSock, "INVALID_COMMAND##END##\n", 23, 0);
+             }
+
+             p_msg += strlen("##END##");
+             strcpy(msg, p_msg); // Move remaining buffer to the start
+             p_msg = msg;
         }
     }
 
-    // 클라이언트 연결 종료 처리
+    // 클라이언트 연결 종료
     WaitForSingleObject(hMutex, INFINITE);
     for (int i = 0; i < clntCnt; i++) {
         if (clntSocks[i].sock == hClntSock) {
             printf("클라이언트 연결 종료: %s\n", clntSocks[i].id);
-            while (i < clntCnt - 1) {
-                clntSocks[i] = clntSocks[i + 1];
-                i++;
+            for (int j = i; j < clntCnt - 1; j++) {
+                clntSocks[j] = clntSocks[j + 1];
             }
             clntCnt--;
             break;
@@ -202,31 +193,27 @@ unsigned WINAPI HandleClient(void* arg) {
     return 0;
 }
 
-// 사용자 인증
 int AuthenticateUser(char* id, char* pw) {
     FILE* fp = fopen("users.txt", "r");
     if (fp == NULL) return 0;
-
     char fileId[30], filePw[30];
     while (fscanf(fp, "%s %s", fileId, filePw) != EOF) {
         if (strcmp(id, fileId) == 0 && strcmp(pw, filePw) == 0) {
             fclose(fp);
-            return 1;
+            return 1; // 인증 성공
         }
     }
     fclose(fp);
-    return 0;
+    return 0; // 인증 실패
 }
 
-// 프로젝트 생성
 void CreateProject(char* projectName, SOCKET sock) {
+    strtok(projectName, "\n");
     if (projectName == NULL || strlen(projectName) == 0) {
         send(sock, "PROJECT_CREATE_FAIL##END##\n", 27, 0);
         return;
     }
-    
-    int result = _mkdir(projectName);
-    if (result == 0) {
+    if (_mkdir(projectName) == 0) {
         send(sock, "PROJECT_CREATED##END##\n", 22, 0);
     } else if (errno == EEXIST) {
         send(sock, "PROJECT_EXISTS##END##\n", 21, 0);
@@ -235,215 +222,216 @@ void CreateProject(char* projectName, SOCKET sock) {
     }
 }
 
-// 커밋 처리
 void ProcessCommit(char* data, SOCKET sock, char* userID) {
     char* projectName = strtok(data, "\n");
     char* title = strtok(NULL, "\n");
     char* message = strtok(NULL, "\n");
-    char* code = strtok(NULL, "");
+    char* code = message + strlen(message) + 1;
 
     if (!projectName || !title || !message || !code) {
-        send(sock, "COMMIT_FAIL##END##\n", 19, 0);
-        return;
+        send(sock, "COMMIT_FAIL##END##\n", 19, 0); return;
     }
-
+    
+    time_t commitID = time(NULL);
     char historyPath[256], snippetsPath[256];
     sprintf(historyPath, "%s/history.txt", projectName);
     sprintf(snippetsPath, "%s/snippets_%s.txt", projectName, userID);
 
     WaitForSingleObject(hMutex, INFINITE);
-
-    // history.txt 파일에 메타데이터 기록
     FILE* hfp = fopen(historyPath, "a");
-    if (!hfp) {
-        ReleaseMutex(hMutex);
-        send(sock, "COMMIT_FAIL##END##\n", 19, 0);
-        return;
-    }
-    
-    time_t t = time(NULL);
-    fprintf(hfp, "CommitID: %ld | Title: %s | Author: %s | Message: %s\n", (long)t, title, userID, message);
+    if (!hfp) { ReleaseMutex(hMutex); return; }
+    fprintf(hfp, "CommitID: %ld | Title: %s | Author: %s | Message: %s\n", (long)commitID, title, userID, message);
     fclose(hfp);
 
-    // snippets 파일에 코드 내용 기록
     FILE* sfp = fopen(snippetsPath, "a");
-    if (!sfp) {
-        // Rollback history entry would be ideal here, but for simplicity, we continue
-        ReleaseMutex(hMutex);
-        send(sock, "COMMIT_FAIL##END##\n", 19, 0);
-        return;
-    }
-    fprintf(sfp, "--- Commit at %ld ---\n", (long)t);
-    fprintf(sfp, "Title: %s\n", title);
-    fprintf(sfp, "Message: %s\n", message);
-    fprintf(sfp, "Code:\n%s\n\n", code);
+    if (!sfp) { ReleaseMutex(hMutex); return; }
+    fprintf(sfp, "--- Commit at %ld ---\n", (long)commitID);
+    fprintf(sfp, "%s\n", code);
     fclose(sfp);
-
     ReleaseMutex(hMutex);
-    
+
     send(sock, "COMMIT_SUCCESS##END##\n", 22, 0);
-    
-    // 다른 클라이언트에게 커밋 알림 전송
     BroadcastUpdate(projectName, sock);
 }
 
-
-// 프로젝트의 히스토리 내용을 클라이언트에게 전송
 void SendHistory(char* projectName, SOCKET sock) {
-    char historyPath[256];
-    char buffer[MAX_MSG_LEN] = {0};
+    strtok(projectName, "\n");
+    char historyPath[256], buffer[MAX_MSG_LEN] = {0};
     sprintf(historyPath, "%s/history.txt", projectName);
 
     WaitForSingleObject(hMutex, INFINITE);
-
     FILE* fp = fopen(historyPath, "r");
     if (!fp) {
-        ReleaseMutex(hMutex);
-        strcat(buffer, "이 프로젝트에 대한 히스토리가 없습니다.");
+        strcpy(buffer, "이 프로젝트에 대한 히스토리가 없습니다.");
     } else {
         fread(buffer, 1, MAX_MSG_LEN - 100, fp);
         fclose(fp);
     }
-
     ReleaseMutex(hMutex);
-    
+
     strcat(buffer, "##END##\n");
     send(sock, buffer, strlen(buffer), 0);
 }
 
+void RevokeCommit(char* data, SOCKET sock) {
+    char* projectName = strtok(data, "\n");
+    char* commitIdStr = strtok(NULL, "\n");
 
-// 커밋 무효화 기능
-void RevokeCommitByID(char* projectName, char* commitID, char* userID, SOCKET sock) {
-    if (!projectName || !commitID || !userID) {
-        send(sock, "REVOKE_FAIL##END##\n", 20, 0);
-        return;
+    if (!projectName || !commitIdStr) {
+        send(sock, "REVOKE_FAIL##END##\n", 20, 0); return;
     }
 
-    char historyPath[256], tempHistoryPath[256];
-    char snippetPath[256], tempSnippetPath[256];
-    char logPath[256];
+    char historyPath[256], tempHistoryPath[256], revokedPath[256], line[1024];
+    char authorID[30] = {0}, revokedHistoryLine[1024] = {0}, revokedSnippet[BUF_SIZE] = {0};
+    int found = 0;
 
     sprintf(historyPath, "%s/history.txt", projectName);
+    sprintf(revokedPath, "%s/revoked_log.txt", projectName);
     sprintf(tempHistoryPath, "%s/history.tmp", projectName);
-    sprintf(snippetPath, "%s/snippets_%s.txt", projectName, userID);
-    sprintf(tempSnippetPath, "%s/snippets_%s.tmp", projectName, userID);
-    sprintf(logPath, "%s/revoked_log.txt", projectName);
 
     WaitForSingleObject(hMutex, INFINITE);
 
-    FILE* hRead = fopen(historyPath, "r");
-    FILE* hWrite = fopen(tempHistoryPath, "w");
-    FILE* sRead = fopen(snippetPath, "r");
-    FILE* sWrite = fopen(tempSnippetPath, "w");
-    FILE* log = fopen(logPath, "a");
+    // 1. Find commit in history.txt, get author, and create new history
+    FILE* h_orig = fopen(historyPath, "r");
+    FILE* h_temp = fopen(tempHistoryPath, "w");
+    if (!h_orig || !h_temp) { /* error handling */ ReleaseMutex(hMutex); return; }
 
-    int found = 0;
-    char line[2048];
-    char historyBackup[2048] = "";
-    char snippetBackup[8192] = "";
+    char searchStr[100];
+    sprintf(searchStr, "CommitID: %s |", commitIdStr);
 
-    if (!hRead || !hWrite || !sRead || !sWrite || !log) {
-        if (hRead) fclose(hRead);
-        if (hWrite) fclose(hWrite);
-        if (sRead) fclose(sRead);
-        if (sWrite) fclose(sWrite);
-        if (log) fclose(log);
-        ReleaseMutex(hMutex);
-        send(sock, "REVOKE_FAIL##END##\n", 20, 0);
-        return;
-    }
-
-    // 히스토리에서 해당 CommitID 찾아서 제거 + 백업
-    while (fgets(line, sizeof(line), hRead)) {
-        if (!found && strstr(line, commitID)) {
+    while (fgets(line, sizeof(line), h_orig)) {
+        if (!found && strstr(line, searchStr)) {
             found = 1;
-            strcpy(historyBackup, line);
+            strcpy(revokedHistoryLine, line);
+            char* p_author = strstr(line, "Author: ") + strlen("Author: ");
+            char* p_author_end = strstr(p_author, " |");
+            strncpy(authorID, p_author, p_author_end - p_author);
         } else {
-            fputs(line, hWrite);
+            fputs(line, h_temp);
         }
     }
+    fclose(h_orig);
+    fclose(h_temp);
 
-    fclose(hRead);
-    fclose(hWrite);
+    if (found) {
+        remove(historyPath);
+        rename(tempHistoryPath, historyPath);
 
-    // 스니펫에서 해당 CommitID 포함된 블록 찾아 제거 + 백업
-    int inTargetBlock = 0;
-    int captured = 0;
-    rewind(sRead);
-    while (fgets(line, sizeof(line), sRead)) {
-        if (strstr(line, commitID) && strstr(line, "--- Commit at ")) {
-            inTargetBlock = 1;
-            strcat(snippetBackup, line);
-            captured = 1;
-            continue;
-        }
+        // 2. Remove snippet from snippets file
+        char snippetsPath[256], tempSnippetsPath[256];
+        sprintf(snippetsPath, "%s/snippets_%s.txt", projectName, authorID);
+        sprintf(tempSnippetsPath, "%s/snippets.tmp", projectName);
+        
+        FILE* s_orig = fopen(snippetsPath, "r");
+        FILE* s_temp = fopen(tempSnippetsPath, "w");
 
-        if (inTargetBlock) {
-            strcat(snippetBackup, line);
-            if (strcmp(line, "\n") == 0) {
-                inTargetBlock = 0;
+        int in_block = 0;
+        sprintf(searchStr, "--- Commit at %s ---", commitIdStr);
+        
+        while (fgets(line, sizeof(line), s_orig)) {
+            if (strstr(line, searchStr)) {
+                in_block = 1;
+                strcat(revokedSnippet, line);
+                continue;
             }
-            continue;
+            if (in_block && strncmp(line, "--- Commit at", 13) == 0) {
+                in_block = 0; // Next block started
+            }
+            
+            if (in_block) {
+                 strcat(revokedSnippet, line);
+            } else {
+                fputs(line, s_temp);
+            }
         }
+        fclose(s_orig);
+        fclose(s_temp);
+        remove(snippetsPath);
+        rename(tempSnippetsPath, snippetsPath);
 
-        fputs(line, sWrite);
-    }
+        // 3. Write to revoked_log.txt
+        FILE* r_log = fopen(revokedPath, "a");
+        fprintf(r_log, "[HISTORY]\n%s\n[SNIPPET]\n%s\n\n", revokedHistoryLine, revokedSnippet);
+        fclose(r_log);
 
-    fclose(sRead);
-    fclose(sWrite);
-
-    // 삭제한 내용 로그에 백업
-    if (captured && found) {
-        fprintf(log, "[HISTORY] %s", historyBackup);
-        fprintf(log, "[SNIPPET]\n%s\n", snippetBackup);
-    }
-
-    fclose(log);
-
-    // 파일 교체
-    remove(historyPath);
-    rename(tempHistoryPath, historyPath);
-    remove(snippetPath);
-    rename(tempSnippetPath, snippetPath);
-
-    ReleaseMutex(hMutex);
-
-    if (captured && found) {
         send(sock, "REVOKE_SUCCESS##END##\n", 23, 0);
         BroadcastUpdate(projectName, sock);
     } else {
+        remove(tempHistoryPath); // cleanup
         send(sock, "REVOKE_FAIL_NOT_FOUND##END##\n", 29, 0);
     }
+
+    ReleaseMutex(hMutex);
 }
 
 
-// 프로젝트 변경 사항을 다른 클라이언트들에게 알림
+void SendCommitCode(char* data, SOCKET sock) {
+    char* projectName = strtok(data, "\n");
+    char* commitIdStr = strtok(NULL, "\n");
+    if (!projectName || !commitIdStr) return;
+
+    char historyPath[256], line[1024], authorID[30] = {0};
+    int found_history = 0;
+    sprintf(historyPath, "%s/history.txt", projectName);
+
+    WaitForSingleObject(hMutex, INFINITE);
+    FILE* hfp = fopen(historyPath, "r");
+    if (!hfp) { ReleaseMutex(hMutex); return; }
+
+    char searchStr[100];
+    sprintf(searchStr, "CommitID: %s |", commitIdStr);
+
+    while (fgets(line, sizeof(line), hfp)) {
+        if (strstr(line, searchStr)) {
+            found_history = 1;
+            char* p_author = strstr(line, "Author: ") + strlen("Author: ");
+            char* p_author_end = strstr(p_author, " |");
+            strncpy(authorID, p_author, p_author_end - p_author);
+            break;
+        }
+    }
+    fclose(hfp);
+
+    if (found_history) {
+        char snippetsPath[256], codeBuffer[BUF_SIZE] = {0};
+        sprintf(snippetsPath, "%s/snippets_%s.txt", projectName, authorID);
+        FILE* sfp = fopen(snippetsPath, "r");
+        if(sfp){
+            int in_block = 0;
+            sprintf(searchStr, "--- Commit at %s ---", commitIdStr);
+            while (fgets(line, sizeof(line), sfp)) {
+                if (strstr(line, searchStr)) {
+                    in_block = 1;
+                    continue;
+                }
+                if (in_block && strncmp(line, "--- Commit at", 13) == 0) break;
+                if (in_block) strcat(codeBuffer, line);
+            }
+            fclose(sfp);
+
+            char response[MAX_MSG_LEN];
+            sprintf(response, "HISTORY_CODE_RESPONSE\n%s##END##\n", codeBuffer);
+            send(sock, response, strlen(response), 0);
+        }
+    } else {
+         send(sock, "HISTORY_CODE_FAIL##END##\n", 25, 0);
+    }
+    ReleaseMutex(hMutex);
+}
+
+
 void BroadcastUpdate(char* projectName, SOCKET from_sock) {
     char msg[100];
     sprintf(msg, "UPDATE\n%s\n##END##\n", projectName);
-    
+
     WaitForSingleObject(hMutex, INFINITE);
-    for(int i = 0; i < clntCnt; i++) {
-        // 원래 커밋한 클라이언트를 제외한 나머지에게만 전송
+    for (int i = 0; i < clntCnt; i++) {
         if (clntSocks[i].sock != from_sock) {
             send(clntSocks[i].sock, msg, strlen(msg), 0);
         }
     }
     ReleaseMutex(hMutex);
 }
-
-
-// 커밋 리스트 전송 (간소화된 구현: history 전체를 전송)
-void SendList(char* projectName, SOCKET sock) {
-    // 실제로는 제목만 추출하는 것이 좋았겠지만, 단순화를 위해 history 전체 전송
-    SendHistory(projectName, sock);
-}
-// 커밋 검색 (클라이언트 측에서 검색하도록 유도)
-void SearchCommits(char* projectName, char* keyword, SOCKET sock) {
-    // 계획대로의 구현이라면 검색 결과만 추출해야 하지만, 단순화를 위해 history 전체 전송
-    SendHistory(projectName, sock);
-}
-
 
 void ErrorHandling(char* msg) {
     fputs(msg, stderr);
