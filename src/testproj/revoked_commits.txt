@@ -1,2 +1,0 @@
-CommitID: 1750157133 | Title: test | Author: samel123 | Message: 첫 커밋 테스트
-CommitID: 1750166739 | Title: HelloWorld | Author: samel123 | Message: int main() { print("HelloWorld"); }
